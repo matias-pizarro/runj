@@ -39,7 +39,7 @@ func downloadRootfsCommand() *cobra.Command {
 		Long:  "Download the base.txz for a given FreeBSD release and architecture",
 	}
 	arch := dl.Flags().StringP("architecture", "a", "", "CPU architecture, like amd64")
-	version := dl.Flags().StringP("version", "v", "", "FreeBSD version, like 12-RELEASE")
+	version := dl.Flags().StringP("version", "v", "", "FreeBSD version, like 12.0-RELEASE")
 	outputFilename := dl.Flags().StringP("output", "o", "rootfs.txz", "Output filename")
 	dl.RunE = func(cmd *cobra.Command, args []string) error {
 		if *arch == "" {
@@ -75,7 +75,7 @@ func imageCommand() *cobra.Command {
 		Long:  "Create an OCI image, optionally downloading if a rootfs file is not already present",
 	}
 	arch := cmd.Flags().StringP("architecture", "a", "", "CPU architecture, like amd64")
-	version := cmd.Flags().StringP("version", "v", "", "FreeBSD version, like 12-RELEASE")
+	version := cmd.Flags().StringP("version", "v", "", "FreeBSD version, like 12.0-RELEASE")
 	inputFilename := cmd.Flags().StringP("input", "i", "", "Input rootfs (txz format)")
 	outputFilename := cmd.Flags().StringP("output", "o", "image.tar", "Output filename")
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
