@@ -39,7 +39,7 @@ The root filesystem can consist either of a regular FreeBSD userland or a
 reduced set of FreeBSD-compatible programs.  For experimentation, 
 statically-linked programs from `/recovery` may be copied into your bundle.  You
 can obtain a regular FreeBSD userland suitable for use with runj from
-`http://ftp.freebsd.org/pub/FreeBSD/releases/$ARCH/$VERSION/base.txz` (where
+`https://download.freebsd.org/ftp/releases/$ARCH/$VERSION/base.txz` (where
 `$ARCH` and `$VERSION` are replaced by your architecture and desired version
 respectively).  Several `demo` convenience commands have been provided in runj
 to assist in experimentation; you can use `runj demo download` to retrieve a
