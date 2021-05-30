@@ -47,7 +47,7 @@ func NewService(ctx context.Context, id string, publisher shim.Publisher, shutdo
 		// subscribe to the reaper to receive process exit information
 		exits: reaper.Default.Subscribe(),
 		primary: managedProcess{
-			waitblock: make(chan struct{}, 0),
+			waitblock: make(chan struct{}),
 		},
 		auxiliary: make(map[string]*managedProcess),
 	}
@@ -68,7 +68,7 @@ func NewService(ctx context.Context, id string, publisher shim.Publisher, shutdo
 // processExits handles exits for child processes inside the jail
 func (s *service) processExits() {
 	for e := range s.exits {
-		log.G(s.context).WithField("pid", e.Pid).Warn("PROCESSING EXIT!")
+		log.G(s.context).WithField("pid", e.Pid).WithField("status", e.Status).Warn("PROCESSING EXIT!")
 		s.checkProcesses(e)
 	}
 }
@@ -200,13 +200,13 @@ type service struct {
 // or some other decision.  When this function returns, the current process
 // exits.  If there is no existing shim with an address to use, this function
 // must fork a new shim process.
-func (s *service) StartShim(ctx context.Context, id, containerdBinary, containerdAddress, containerdTTRPCAddress string) (string, error) {
-	cmd, err := newReexec(ctx, id, containerdAddress)
+func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (string, error) {
+	cmd, err := newReexec(ctx, opts.ID, opts.Address)
 	if err != nil {
 		return "", err
 	}
 
-	address, err := shim.SocketAddress(ctx, containerdAddress, id)
+	address, err := shim.SocketAddress(ctx, opts.Address, opts.ID)
 	if err != nil {
 		return "", err
 	}
@@ -382,6 +382,7 @@ func (s *service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 		return nil, errdefs.ErrInvalidArgument
 	}
 	s.setBundlePath(req.Bundle)
+	err := filterIncompatibleLinuxMounts(req.Bundle)
 
 	var mounts []process.Mount
 	for _, m := range req.Rootfs {
@@ -401,7 +402,6 @@ func (s *service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 			return nil, err
 		}
 	}
-	var err error
 	defer func() {
 		if err != nil {
 			log.G(ctx).WithField("rootfs", rootfs).WithError(err).Error("failed to create,unmounting rootfs")
@@ -500,16 +500,9 @@ func (s *service) newAuxiliary(id string) *managedProcess {
 	}
 
 	s.auxiliary[id] = &managedProcess{
-		waitblock: make(chan struct{}, 0),
+		waitblock: make(chan struct{}),
 	}
 	return s.auxiliary[id]
-}
-
-func (s *service) setAuxiliary(id string, aux *managedProcess) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.auxiliary[id] = aux
 }
 
 func (s *service) deleteAuxiliary(id string) {
@@ -649,8 +642,9 @@ func (s *service) startAux(ctx context.Context, id, execID string) (*task.StartR
 	s.eventSendMu.Lock()
 	defer s.eventSendMu.Unlock()
 	pio := proc.GetStdio()
+	spec := proc.GetSpec()
 
-	pid, err := execExec(ctx, id, proc.GetSpecfile(), pio.stdin, pio.stdout, pio.stderr)
+	pid, con, err := execExec(ctx, id, proc.GetSpecfile(), pio.stdin, pio.stdout, pio.stderr, spec.Terminal)
 	log.G(ctx).WithField("execID", execID).WithError(err).Warn("START EXEC runj")
 	if err != nil {
 		proc.SetState(state.StatusStopped)
@@ -658,10 +652,12 @@ func (s *service) startAux(ctx context.Context, id, execID string) (*task.StartR
 		return nil, err
 	}
 	proc.SetPID(pid)
+	proc.SetConsole(con)
 	proc.SetState(state.StatusRunning)
 
-	s.sendUnsafe(&events.TaskStart{
+	s.sendUnsafe(&events.TaskExecStarted{
 		ContainerID: id,
+		ExecID:      execID,
 		Pid:         uint32(pid),
 	})
 	return &task.StartResponse{
@@ -669,7 +665,7 @@ func (s *service) startAux(ctx context.Context, id, execID string) (*task.StartR
 	}, nil
 }
 
-func (s service) Pids(ctx context.Context, req *task.PidsRequest) (*task.PidsResponse, error) {
+func (s *service) Pids(ctx context.Context, req *task.PidsRequest) (*task.PidsResponse, error) {
 	log.G(ctx).WithField("req", req).Warn("PIDS")
 	return nil, errdefs.ErrNotImplemented
 }
@@ -732,6 +728,9 @@ func (s *service) Exec(ctx context.Context, req *task.ExecProcessRequest) (*type
 		return nil, errdefs.ErrInvalidArgument
 	}
 	l.WithField("spec", spec).Warn("EXEC")
+	if req.Terminal {
+		spec.Terminal = true
+	}
 	aux := s.newAuxiliary(req.ExecID)
 	if aux == nil {
 		return nil, errdefs.ErrAlreadyExists
@@ -772,17 +771,22 @@ func (s *service) Exec(ctx context.Context, req *task.ExecProcessRequest) (*type
 
 func (s *service) ResizePty(ctx context.Context, req *task.ResizePtyRequest) (*types.Empty, error) {
 	log.G(ctx).WithField("req", req).Warn("RESIZEPTY")
-	if req.ExecID != "" {
-		log.G(ctx).WithField("execID", req.ExecID).Error("Exec not implemented!")
-		return nil, errdefs.ErrNotImplemented
-	}
 	if req.ID != s.id {
 		log.G(ctx).WithField("reqID", req.ID).WithField("id", s.id).Error("mismatched IDs")
 		return nil, errdefs.ErrInvalidArgument
 	}
-	con := s.primary.GetConsole()
+	var con console.Console
+	if req.ExecID == "" {
+		con = s.primary.GetConsole()
+	} else {
+		aux := s.getAuxiliary(req.ExecID)
+		if aux == nil {
+			return nil, errdefs.ErrNotFound
+		}
+		con = aux.GetConsole()
+	}
 	if con == nil {
-		return nil, errdefs.ErrUnavailable
+		return empty, nil
 	}
 	if err := con.Resize(console.WinSize{
 		Width:  uint16(req.Width),

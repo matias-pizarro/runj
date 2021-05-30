@@ -39,34 +39,58 @@ func execCreate(ctx context.Context, id, bundle string, stdin io.Reader, stdout 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if terminal && cmd.Stderr == nil {
-		cmd.Stderr = log.G(ctx).WriterLevel(logrus.WarnLevel)
+		cmd.Stderr = log.G(ctx).WithField("cmd", "runj create").WriterLevel(logrus.WarnLevel)
 	}
 	log.G(ctx).WithField("id", id).WithField("args", args).Warn("Starting runj create")
 	ec, err := reaper.Default.Start(cmd)
-
-	var con console.Console
-	if socket != nil {
-		con, err = socket.ReceiveMaster()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to retrieve console master")
-		}
-		log.G(ctx).WithField("id", id).Warn("Received console master!")
-		err = copyConsole(ctx, con, stdin, stdout, stderr)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to start console copy")
-		}
-		log.G(ctx).WithField("id", id).Warn("Copying console!")
+	if err != nil {
+		return nil, err
 	}
 
-	_, err = WaitNoFlush(cmd, ec)
+	ready := make(chan struct {
+		con console.Console
+		err error
+	})
+	if socket != nil {
+		go func() {
+			con, err := func() (console.Console, error) {
+				con, err := socket.ReceiveMaster()
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to retrieve console master")
+				}
+				log.G(ctx).WithField("id", id).Warn("Received console master!")
+				err = copyConsole(ctx, con, stdin, stdout, stderr)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to start console copy")
+				}
+				log.G(ctx).WithField("id", id).Warn("Copying console!")
+				return con, nil
+			}()
+			ready <- struct {
+				con console.Console
+				err error
+			}{con, err}
+			close(ready)
+		}()
+	}
+
+	ret, err := WaitNoFlush(cmd, ec)
 	if err != nil {
 		log.G(ctx).WithError(err).WithField("id", id).Error("runj create failed")
+		return nil, err
 	}
-	return con, err
+	if ret != 0 {
+		log.G(ctx).WithField("exit", ret).Error("runj create failed")
+		return nil, errors.New("runj create failed")
+	}
+	if socket != nil {
+		ret := <-ready
+		return ret.con, ret.err
+	}
+	return nil, nil
 }
 
 func copyConsole(ctx context.Context, console console.Console, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
-	// TODO figure out whether we need a waitgroup for process stdio
 	var cwg sync.WaitGroup
 	if stdin != nil {
 		cwg.Add(1)
@@ -165,20 +189,49 @@ func execStart(ctx context.Context, id string) error {
 }
 
 // execExec runs the "extension exec" subcommand for runj
-func execExec(ctx context.Context, id, processJsonFilename string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (int, error) {
-	cmd := exec.CommandContext(ctx, "runj", "extension", "exec", id, "--process", processJsonFilename)
+func execExec(ctx context.Context, id, processJSONFilename string, stdin io.Reader, stdout io.Writer, stderr io.Writer, terminal bool) (int, console.Console, error) {
+	args := []string{"extension", "exec", id, "--process", processJSONFilename}
+	var socket *runc.Socket
+	if terminal {
+		log.G(ctx).WithField("id", id).Warn("Creating terminal!")
+		var err error
+		socket, err = runc.NewTempConsoleSocket()
+		if err != nil {
+			return -1, nil, fmt.Errorf("create: failed to create runj console socket: %w", err)
+		}
+		defer socket.Close()
+		args = append(args, "--console-socket", socket.Path())
+	}
+
+	cmd := exec.CommandContext(ctx, "runj", args...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if cmd.Stderr == nil {
-		cmd.Stderr = log.G(ctx).WriterLevel(logrus.WarnLevel)
+		cmd.Stderr = log.G(ctx).WithField("cmd", "runj ext exec").WriterLevel(logrus.WarnLevel)
 	}
 	log.G(ctx).WithField("id", id).Warn("Starting runj extension exec")
 	err := cmd.Start()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return cmd.Process.Pid, nil
+	pid := cmd.Process.Pid
+
+	var con console.Console
+	if socket != nil {
+		con, err = socket.ReceiveMaster()
+		if err != nil {
+			return pid, nil, errors.Wrap(err, "failed to retrieve console master")
+		}
+		log.G(ctx).WithField("id", id).Warn("Received exec console master!")
+		err = copyConsole(ctx, con, stdin, stdout, stderr)
+		if err != nil {
+			return pid, nil, errors.Wrap(err, "failed to start console copy")
+		}
+		log.G(ctx).WithField("id", id).Warn("Copying exec console!")
+	}
+
+	return pid, con, nil
 }
 
 func combinedOutput(cmd *exec.Cmd) ([]byte, error) {
@@ -186,6 +239,9 @@ func combinedOutput(cmd *exec.Cmd) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stdout
 	ec, err := reaper.Default.Start(cmd)
+	if err != nil {
+		return nil, err
+	}
 	_, err = reaper.Default.Wait(cmd, ec)
 	b := stdout.Bytes()
 	return b, err
